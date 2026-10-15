@@ -443,6 +443,68 @@ func TestDriver_UROWID_014_MalformedAndNull(t *testing.T) {
 	})
 }
 
+// TestDriver_UROWID_015_ConvertedTextRoundTrip checks server-converted locator strings and
+// their reuse as application inputs. This standalone proof of concept runs directly by name;
+// it does not assert native UROWID support or belong to the published test specification.
+func TestDriver_UROWID_015_ConvertedTextRoundTrip(t *testing.T) {
+	f := newUROWIDSession(t)
+	file := f.prefix + "_text.csv"
+	f.writeFile(t, file, urowidBaseCSV)
+	table := f.createExternal(t, "TEXT", file, true)
+	locators := make(map[int64]string)
+
+	// Fetch character data only, then compare its complete value with the PL/SQL reference.
+	if !t.Run("converted_fetch", func(t *testing.T) {
+		for _, id := range []int64{2, 4} {
+			var rid string
+			var textLength int64
+			err := f.conn.QueryRowContext(f.ctx,
+				"SELECT CAST(ROWID AS VARCHAR2(4000)), LENGTH(CAST(ROWID AS VARCHAR2(4000))) FROM "+table+" WHERE id = :id",
+				sql.Named("id", id)).Scan(&rid, &textLength)
+			urowidRequireNoError(t, "fetch converted UROWID text", err)
+			// Locator text is ASCII, so its character count must equal the Go byte length.
+			if rid == "" || int64(len(rid)) != textLength {
+				t.Fatalf("row %d: converted locator has %d bytes, server reports %d characters; require nonempty complete text",
+					id, len(rid), textLength)
+			}
+			urowidCheckText(t, rid, f.referenceText(t, table, id))
+			locators[id] = rid
+		}
+	}) {
+		// The bind scenarios require successfully fetched and validated locator strings.
+		return
+	}
+
+	// A positional string argument must retrieve exactly its original row and payload.
+	t.Run("positional_bind", func(t *testing.T) {
+		for _, id := range []int64{2, 4} {
+			f.checkQueryRows(t, "SELECT id, RTRIM(payload) FROM "+table+" WHERE ROWID = :1",
+				[]int64{id}, locators[id])
+		}
+	})
+
+	// Exercise the same round trip through the public named-bind interface.
+	t.Run("named_bind", func(t *testing.T) {
+		for _, id := range []int64{2, 4} {
+			f.checkLookup(t, table, locators[id], id)
+		}
+	})
+
+	// Reuse one prepared statement for rows 2, 4 and 2 to catch stale bind values.
+	t.Run("prepared_reuse", func(t *testing.T) {
+		stmt, err := f.conn.PrepareContext(f.ctx,
+			"SELECT id, RTRIM(payload) FROM "+table+" WHERE ROWID = :rid")
+		urowidRequireNoError(t, "prepare converted UROWID lookup", err)
+		defer stmt.Close()
+		for _, id := range []int64{2, 4, 2} {
+			rows, err := stmt.QueryContext(f.ctx, sql.Named("rid", locators[id]))
+			urowidRequireNoError(t, "execute prepared converted UROWID lookup", err)
+			urowidCheckRows(t, rows, []int64{id})
+		}
+		urowidRequireNoError(t, "close prepared converted UROWID lookup", stmt.Close())
+	})
+}
+
 // Compatibility prerequisite: read the live parameter before creating resources.
 
 // TestUROWIDCompatibleVersion checks numeric ordering and rejects malformed live parameter
